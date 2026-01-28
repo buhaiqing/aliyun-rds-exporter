@@ -1,0 +1,4 @@
+- [Added]2024.08.25 基础功能上线
+- [Added]2024.08.26 支持定义过滤，只采集某些实例;Docker制品发布海鼎私服；按实例提供自定义标签
+- [Added]2024.08.27 RDS示例规格描述 - aliyun_rds_spec{}
+- [Added]2024.09.05 提供定义ResourceGroupId配置
