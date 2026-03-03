@@ -138,30 +138,118 @@ class AliyunRDSCollector(object):
 
     @cached(cache=TTLCache(maxsize=4096, ttl=50))
     def query_rds_performance_data_list(self):
-        # 调用阿里云API请求RDS实例的性能数据
+        """
+        批量查询RDS实例性能数据。
+        利用阿里云API的Key参数支持批量查询特性（每批次最多30个指标），
+        大幅减少API调用次数，提升采集性能。
+        """
         rds_instance_list = self.query_rds_instance_list()
+        instance_count = len(rds_instance_list)
+        logging.info(f"[Performance] 开始采集性能数据，共 {instance_count} 个实例")
+
         now = datetime.datetime.utcnow()
         starttime = (now - datetime.timedelta(minutes=3)).strftime('%Y-%m-%dT%H:%MZ')
         endtime = now.strftime('%Y-%m-%dT%H:%MZ')
         performance_lists = self.config.performance_list
+
+        # 每批次最多30个指标（阿里云API限制）
+        BATCH_SIZE = 30
         request_task_list = []
-        for i in range(len(rds_instance_list)):
-            DBInstanceId = rds_instance_list[i]['DBInstanceId']
-            Engine = rds_instance_list[i]['Engine']
-            rds_performance_list = performance_lists[Engine]
-            for j in range(len(rds_performance_list)):
+
+        for instance in rds_instance_list:
+            DBInstanceId = instance['DBInstanceId']
+            Engine = instance['Engine']
+            rds_performance_list = performance_lists.get(Engine, [])
+
+            if not rds_performance_list:
+                logging.warning(f"[Performance] 实例 {DBInstanceId} 引擎类型 {Engine} 没有配置性能指标")
+                continue
+
+            # 将指标列表按 BATCH_SIZE 分批
+            for batch_start in range(0, len(rds_performance_list), BATCH_SIZE):
+                batch_keys = rds_performance_list[batch_start:batch_start + BATCH_SIZE]
+                batch_keys_str = ','.join(batch_keys)
+
                 request = DescribeDBInstancePerformanceRequest()
-                performance_key = rds_performance_list[j]
                 request.set_DBInstanceId(DBInstanceId)
                 request.set_accept_format('json')
                 request.set_StartTime(starttime)
                 request.set_EndTime(endtime)
-                request.set_Key(performance_key)
-                request_task_list.append(request)
+                request.set_Key(batch_keys_str)
+
+                request_task_list.append({
+                    'request': request,
+                    'instance_id': DBInstanceId,
+                    'engine': Engine,
+                    'batch_keys': batch_keys,
+                    'batch_index': batch_start // BATCH_SIZE
+                })
+
+        total_batches = len(request_task_list)
+        logging.info(f"[Performance] 共生成 {total_batches} 个批量查询请求（每批最多{BATCH_SIZE}个指标）")
+
+        if not request_task_list:
+            logging.info("[Performance] 没有需要查询的性能数据")
+            return []
+
+        # 批量执行API请求
+        rds_performance_data_list = []
         with futures.ThreadPoolExecutor(50) as executor:
-            response = executor.map(self.aliyun_client_do_action, request_task_list)
-        rds_performance_data_list = list(response)
+            future_to_task = {
+                executor.submit(
+                    self._fetch_performance_batch,
+                    task['request'],
+                    task['instance_id'],
+                    task['engine'],
+                    task['batch_keys'],
+                    task['batch_index']
+                ): task
+                for task in request_task_list
+            }
+
+            for future in futures.as_completed(future_to_task):
+                task = future_to_task[future]
+                try:
+                    result = future.result()
+                    if result:
+                        rds_performance_data_list.append(result)
+                except Exception as e:
+                    logging.error(
+                        f"[Performance] 实例 {task['instance_id']} 第 {task['batch_index'] + 1} 批指标查询失败: {e}"
+                    )
+
+        logging.info(f"[Performance] 性能数据采集完成，成功获取 {len(rds_performance_data_list)} 批数据")
         return rds_performance_data_list
+
+    def _fetch_performance_batch(self, request, instance_id, engine, batch_keys, batch_index):
+        """
+        执行单个批量性能数据查询请求，包含详细日志记录。
+        """
+        start_time = datetime.datetime.now()
+        keys_str = ','.join(batch_keys)
+        logging.debug(f"[Performance] 开始查询实例 {instance_id} 第 {batch_index + 1} 批指标: {keys_str}")
+
+        try:
+            response = self.client.do_action_with_exception(request)
+            elapsed = (datetime.datetime.now() - start_time).total_seconds()
+            api_request_summry.labels(api='DescribeDBInstancePerformanceRequest').observe(amount=elapsed)
+            api_request_count.inc()
+
+            logging.debug(
+                f"[Performance] 实例 {instance_id} 第 {batch_index + 1} 批指标查询成功，"
+                f"耗时 {elapsed:.3f}s，指标数: {len(batch_keys)}"
+            )
+            return response
+
+        except Exception as e:
+            elapsed = (datetime.datetime.now() - start_time).total_seconds()
+            api_request_failed_summry.labels(api='DescribeDBInstancePerformanceRequest').observe(amount=elapsed)
+            api_request_count.inc()
+            logging.error(
+                f"[Performance] 实例 {instance_id} 第 {batch_index + 1} 批指标查询失败，"
+                f"耗时 {elapsed:.3f}s，指标: {keys_str}，错误: {e}"
+            )
+            return None
 
     @cached(cache=TTLCache(maxsize=1024, ttl=60))
     def query_rds_resource_usage_list(self):
@@ -196,43 +284,85 @@ class AliyunRDSCollector(object):
             return []
 
     def generate_rds_performance_metrics(self):
+        """
+        生成RDS性能指标Prometheus指标。
+        处理批量查询返回的数据，遍历每个响应中的所有PerformanceKey。
+        """
         now = datetime.datetime.now()
         rds_performance_data_list = self.query_rds_performance_data_list()
-        logging.debug("rds_performance_data_list used time = {}".format(datetime.datetime.now() - now))
-        for i in range(len(rds_performance_data_list)):
-            if len(rds_performance_data_list[i]) == 0:
-                logging.warning("rds_performance_data_list[{}] == []".format(i))
+        total_metrics = 0
+        logging.info(f"[Metrics] 开始生成性能指标，共 {len(rds_performance_data_list)} 批响应数据")
+
+        for i, response_data in enumerate(rds_performance_data_list):
+            if not response_data or len(response_data) == 0:
+                logging.warning(f"[Metrics] rds_performance_data_list[{i}] 为空")
                 continue
-            rds_performance_data = json.loads(rds_performance_data_list[i].decode("utf-8"))
-            logging.debug("rds_performance_data = {}".format(rds_performance_data))
-            DBInstanceId = rds_performance_data["DBInstanceId"]
-            if len(rds_performance_data['PerformanceKeys']['PerformanceKey']) == 0:
+
+            try:
+                rds_performance_data = json.loads(response_data.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                logging.error(f"[Metrics] 解析第 {i} 批响应数据失败: {e}")
                 continue
-            PerformanceKey = rds_performance_data['PerformanceKeys']['PerformanceKey'][0]
-            Key = PerformanceKey["Key"]
-            Unit = PerformanceKey["Unit"]
-            # logging.error("PerformanceKey = {}".format(rds_performance_data['PerformanceKeys']['PerformanceKey']))
-            if len(PerformanceKey["Values"]["PerformanceValue"]) == 0:
-                logging.warning("{}:{}:{}".format(DBInstanceId, Key.replace('-', '_'),
-                                                  PerformanceKey["Values"]["PerformanceValue"]))
+
+            DBInstanceId = rds_performance_data.get("DBInstanceId", "unknown")
+            performance_keys = rds_performance_data.get('PerformanceKeys', {}).get('PerformanceKey', [])
+
+            if not performance_keys:
+                logging.warning(f"[Metrics] 实例 {DBInstanceId} 没有返回性能指标数据")
                 continue
-            Value = PerformanceKey["Values"]["PerformanceValue"][-1]["Value"].split("&")
-            # Date = PerformanceKey["Values"]["PerformanceValue"][-1]["Date"]
-            ValueFormat = PerformanceKey["ValueFormat"].split("&")
+
+            logging.debug(f"[Metrics] 实例 {DBInstanceId} 返回 {len(performance_keys)} 个指标")
             additional_labels = self.get_additional_labels(DBInstanceId)
-            for k, v in zip(ValueFormat, Value):
-                name = "{}_{}_{}".format("aliyun_rds_performance", Key, k).replace('-', '_')
-                logging.debug("{} = {}".format(name, v))
-                gauge = GaugeMetricFamily(
-                    name=name,
-                    documentation='',
-                    labels=["instanceId", "Unit", ] + list(additional_labels.keys())
-                )
-                gauge.add_metric(
-                    labels=[DBInstanceId, Unit, ] + list(additional_labels.values()),
-                    value=v,
-                )
-                yield gauge
+
+            # 遍历该响应中的所有指标（批量查询会返回多个指标）
+            for perf_key in performance_keys:
+                Key = perf_key.get("Key", "")
+                Unit = perf_key.get("Unit", "")
+                values_list = perf_key.get("Values", {}).get("PerformanceValue", [])
+
+                if not values_list:
+                    logging.warning(f"[Metrics] 实例 {DBInstanceId} 指标 {Key} 没有数值数据")
+                    continue
+
+                # 获取最新时间点的数据
+                latest_value = values_list[-1].get("Value", "")
+                if not latest_value:
+                    logging.warning(f"[Metrics] 实例 {DBInstanceId} 指标 {Key} 最新值为空")
+                    continue
+
+                Value = latest_value.split("&")
+                ValueFormat = perf_key.get("ValueFormat", "").split("&")
+
+                if len(Value) != len(ValueFormat):
+                    logging.warning(
+                        f"[Metrics] 实例 {DBInstanceId} 指标 {Key} 值格式不匹配: "
+                        f"值数量 {len(Value)} vs 格式数量 {len(ValueFormat)}"
+                    )
+                    continue
+
+                for k, v in zip(ValueFormat, Value):
+                    name = f"aliyun_rds_performance_{Key}_{k}".replace('-', '_')
+                    try:
+                        float_value = float(v)
+                    except (ValueError, TypeError):
+                        logging.debug(f"[Metrics] 实例 {DBInstanceId} 指标 {name} 值 '{v}' 无法转换为数字，跳过")
+                        continue
+
+                    logging.debug(f"[Metrics] {name} = {float_value} (实例: {DBInstanceId})")
+                    gauge = GaugeMetricFamily(
+                        name=name,
+                        documentation=f'RDS performance metric: {Key}',
+                        labels=["instanceId", "Unit"] + list(additional_labels.keys())
+                    )
+                    gauge.add_metric(
+                        labels=[DBInstanceId, Unit] + list(additional_labels.values()),
+                        value=float_value,
+                    )
+                    yield gauge
+                    total_metrics += 1
+
+        elapsed = (datetime.datetime.now() - now).total_seconds()
+        logging.info(f"[Metrics] 性能指标生成完成，共生成 {total_metrics} 个指标，耗时 {elapsed:.3f}s")
 
     def query_rds_specs_list(self):
         rds_instance_list = self.query_rds_instance_list()
